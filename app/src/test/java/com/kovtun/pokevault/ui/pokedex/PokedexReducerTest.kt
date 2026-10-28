@@ -37,3 +37,22 @@ class PokedexReducerTest {
         )
     }
 }
+
+class PokedexReducerTypeIndexTest {
+
+    @Test
+    fun `empty list while the type list is downloading is Loading, not Empty`() {
+        assertEquals(
+            ListContent.Loading,
+            PokedexReducer.content(
+                emptyList(), NetworkState.Idle, RemoteSearch.Idle, filtered = true, typeIndex = TypeIndexState.LOADING,
+            ),
+        )
+        assertEquals(
+            ListContent.Empty(filtered = true),
+            PokedexReducer.content(
+                emptyList(), NetworkState.Idle, RemoteSearch.Idle, filtered = true, typeIndex = TypeIndexState.FAILED,
+            ),
+        )
+    }
+}

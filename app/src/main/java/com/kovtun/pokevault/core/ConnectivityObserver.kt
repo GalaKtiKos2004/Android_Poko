@@ -13,10 +13,23 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** Reactive network availability, one of the independent sources the screens combine. */
+/**
+ * Reactive "the internet actually works" signal, one of the sources the screens combine.
+ * It is only a hint for the UI (banner, auto-retry): real requests still decide success.
+ */
 interface ConnectivityObserver {
     val isOnline: Flow<Boolean>
 }
+
+/**
+ * A network counts as online only when it has INTERNET **and** VALIDATED: the system has checked
+ * that it really reaches the internet. Wi-Fi without internet or behind a captive portal
+ * has INTERNET but is not VALIDATED.
+ */
+fun NetworkCapabilities?.hasWorkingInternet(): Boolean =
+    this != null &&
+        hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+        hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
 
 @Singleton
 class AndroidConnectivityObserver @Inject constructor(
@@ -26,27 +39,27 @@ class AndroidConnectivityObserver @Inject constructor(
     override val isOnline: Flow<Boolean> = callbackFlow {
         val manager = context.getSystemService(ConnectivityManager::class.java)
 
-        fun currentlyOnline(): Boolean {
-            val network = manager.activeNetwork ?: return false
-            val caps = manager.getNetworkCapabilities(network) ?: return false
-            return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-        }
+        fun evaluateActive(): Boolean =
+            manager.getNetworkCapabilities(manager.activeNetwork).hasWorkingInternet()
 
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                trySend(true)
+            // onAvailable is deliberately not treated as "online": validation comes later
+            // and is reported through onCapabilitiesChanged.
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                trySend(caps.hasWorkingInternet())
             }
 
             override fun onLost(network: Network) {
-                trySend(false)
+                // Another network may still be active (e.g. Wi-Fi lost, mobile data remains).
+                trySend(evaluateActive())
             }
 
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                trySend(caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET))
+            override fun onUnavailable() {
+                trySend(false)
             }
         }
 
-        trySend(currentlyOnline())
+        trySend(evaluateActive())
         manager.registerDefaultNetworkCallback(callback)
         awaitClose { manager.unregisterNetworkCallback(callback) }
     }.distinctUntilChanged().conflate()

@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
@@ -156,7 +157,9 @@ class DetailViewModel @Inject constructor(
                     )
                 }
         }
+        // A view counts only once the card actually has data to show (cached or just loaded).
         viewModelScope.launch {
+            pokemonRepository.observeDetail(pokemonId).filterNotNull().first()
             val id = profileId.first()
             if (settings.profileSettings(id).first().historyEnabled) {
                 historyRepository.recordView(id, pokemonId)

@@ -1,10 +1,12 @@
 package com.kovtun.pokevault.data.mapper
 
+import com.kovtun.pokevault.data.local.CatalogRow
 import com.kovtun.pokevault.data.local.CollectionItemRow
 import com.kovtun.pokevault.data.local.CollectionWithCount
 import com.kovtun.pokevault.data.local.FilterPresetEntity
 import com.kovtun.pokevault.data.local.HistoryRow
 import com.kovtun.pokevault.data.local.PokemonEntity
+import com.kovtun.pokevault.data.local.PokemonTypeEntity
 import com.kovtun.pokevault.data.local.ProfileEntity
 import com.kovtun.pokevault.data.remote.NamedResourceDto
 import com.kovtun.pokevault.data.remote.PokemonDetailDto
@@ -48,7 +50,20 @@ fun NamedResourceDto.toListEntity(now: Long): PokemonEntity? {
     return PokemonEntity(id = id, name = name, spriteUrl = Sprites.sprite(id), listUpdatedAt = now)
 }
 
-/** Full entity from the detail endpoint. Keeps listUpdatedAt of an already cached row. */
+/** Server list page -> rows with their paging positions (offset + index in page). */
+fun List<NamedResourceDto>.toCatalogRows(offset: Int): List<CatalogRow> =
+    mapIndexedNotNull { i, dto ->
+        idFromUrl(dto.url)?.let { id -> CatalogRow(id, dto.name, Sprites.sprite(id), offset + i) }
+    }
+
+/** Types of a detail response, in slot order, for the pokemon_types index. */
+fun PokemonDetailDto.toTypeEntities(): List<PokemonTypeEntity> =
+    types.sortedBy { it.slot }.map { PokemonTypeEntity(id, it.type.name, it.slot) }
+
+/**
+ * Full entity from the detail endpoint. Keeps listUpdatedAt of an already cached row.
+ * catalogIndex is never taken from here (see PokemonDao.saveDetail).
+ */
 fun PokemonDetailDto.toEntity(now: Long, existing: PokemonEntity?): PokemonEntity =
     PokemonEntity(
         id = id,

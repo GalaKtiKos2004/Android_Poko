@@ -45,3 +45,15 @@ data class AbilitySlotDto(
     val ability: NamedResourceDto,
     @SerialName("is_hidden") val isHidden: Boolean = false,
 )
+
+@Serializable
+data class TypeDetailDto(
+    val name: String,
+    val pokemon: List<TypePokemonDto> = emptyList(),
+)
+
+@Serializable
+data class TypePokemonDto(
+    val slot: Int,
+    val pokemon: NamedResourceDto,
+)

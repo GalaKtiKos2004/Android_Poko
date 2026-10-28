@@ -3,12 +3,21 @@ package com.kovtun.pokevault.sync
 import com.kovtun.pokevault.core.TimeProvider
 import com.kovtun.pokevault.core.isRemoteFailure
 import com.kovtun.pokevault.data.local.PokemonDao
+import com.kovtun.pokevault.data.mapper.Sprites
+import com.kovtun.pokevault.data.mapper.toCatalogRows
 import com.kovtun.pokevault.data.mapper.toEntity
-import com.kovtun.pokevault.data.mapper.toListEntity
+import com.kovtun.pokevault.data.mapper.toTypeEntities
 import com.kovtun.pokevault.data.remote.PokeApi
 import com.kovtun.pokevault.data.settings.SettingsRepository
 import com.kovtun.pokevault.domain.CachePolicy
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -16,86 +25,120 @@ data class SyncReport(
     val listed: Int = 0,
     val detailsUpdated: Int = 0,
     val detailsFailed: Int = 0,
+    val imagesFailed: Int = 0,
     val listFailed: Boolean = false,
 ) {
-    val hadFailures: Boolean get() = listFailed || detailsFailed > 0
+    /** Number of items that could not be brought up to date. */
+    val failures: Int get() = detailsFailed + imagesFailed + if (listFailed) 1 else 0
+
+    /** True only when everything that should be available offline actually is. */
+    val isComplete: Boolean get() = failures == 0
 
     operator fun plus(other: SyncReport) = SyncReport(
         listed = listed + other.listed,
         detailsUpdated = detailsUpdated + other.detailsUpdated,
         detailsFailed = detailsFailed + other.detailsFailed,
+        imagesFailed = imagesFailed + other.imagesFailed,
         listFailed = listFailed || other.listFailed,
     )
 }
 
 /**
  * All background data work, independent of WorkManager so it can be tested directly.
- * A failed request for one pokemon never aborts the whole run.
+ *
+ * - Requests run in parallel, limited to [CONCURRENCY] at a time (hundreds of sequential
+ *   requests would hit the worker's execution limit on a slow network).
+ * - Every pokemon is saved as soon as it is downloaded and fresh ones are skipped, so a retried
+ *   or interrupted run continues where the previous one stopped.
+ * - A failed request for one pokemon never aborts the run, but it is counted: the caller
+ *   decides whether to retry, and "last sync" is stored only for a complete run.
  */
 @Singleton
 class SyncEngine @Inject constructor(
     private val api: PokeApi,
     private val dao: PokemonDao,
     private val settings: SettingsRepository,
+    private val images: ImagePrefetcher,
     private val clock: TimeProvider,
 ) {
 
-    /** Makes the first [count] pokemon fully available offline (list rows + details). */
-    suspend fun prefetch(count: Int, onProgress: suspend (done: Int, total: Int) -> Unit = { _, _ -> }): SyncReport {
-        val listed = try {
-            val page = api.getPokemonList(limit = count, offset = 0)
-            val rows = page.results.mapNotNull { it.toListEntity(clock.now()) }
-            dao.upsertListItems(rows)
-            rows.size
-        } catch (e: Exception) {
-            if (!e.isRemoteFailure()) throw e
-            return SyncReport(listFailed = true)
-        }
-        val ids = dao.idsNeedingDetails(maxId = count, staleBefore = staleBefore())
-        return SyncReport(listed = listed) + fetchDetails(ids, onProgress)
+    /** Makes the first [count] catalogue positions fully available offline: list, details, images. */
+    suspend fun prefetch(
+        count: Int,
+        onProgress: suspend (done: Int, total: Int) -> Unit = { _, _ -> },
+    ): SyncReport {
+        val listReport = loadCatalogPrefix(count)
+        if (listReport.listFailed) return listReport
+        val ids = dao.catalogIds(count)
+        val stale = dao.catalogIdsNeedingDetails(count, staleBefore()).toSet()
+        return listReport + processAll(ids, stale, onProgress)
     }
 
-    /** Refreshes stale details of pokemon that users keep in collections / statuses. */
-    suspend fun refreshUserReferenced(): SyncReport =
-        fetchDetails(dao.userReferencedIdsNeedingDetails(staleBefore()))
+    /** Pokemon users keep (collections / statuses): stale details and missing images. */
+    suspend fun refreshUserReferenced(): SyncReport {
+        val ids = dao.userReferencedIds()
+        val stale = dao.userReferencedIdsNeedingDetails(staleBefore()).toSet()
+        return processAll(ids, stale)
+    }
 
     /** Periodic job: first page of the list + everything users care about. */
     suspend fun periodicSync(): SyncReport {
-        val listReport = try {
-            val now = clock.now()
-            val page = api.getPokemonList(limit = PERIODIC_LIST_SIZE, offset = 0)
-            val rows = page.results.mapNotNull { it.toListEntity(now) }
-            dao.upsertListItems(rows)
-            settings.setLastListRefreshAt(now)
-            SyncReport(listed = rows.size)
-        } catch (e: Exception) {
-            if (!e.isRemoteFailure()) throw e
-            SyncReport(listFailed = true)
-        }
+        val listReport = loadCatalogPrefix(PERIODIC_LIST_SIZE)
+        if (!listReport.listFailed) settings.setLastListRefreshAt(clock.now())
         val report = listReport + refreshUserReferenced()
-        if (!report.listFailed) settings.setLastSyncAt(clock.now())
+        settings.recordSyncAttempt(clock.now(), report.failures)
         return report
     }
 
-    private suspend fun fetchDetails(
+    private suspend fun loadCatalogPrefix(count: Int): SyncReport = try {
+        val page = api.getPokemonList(limit = count, offset = 0)
+        val rows = page.results.toCatalogRows(offset = 0)
+        dao.saveCatalogPage(rows, clock.now())
+        settings.setCatalogTotal(page.count)
+        SyncReport(listed = rows.size)
+    } catch (e: Exception) {
+        if (!e.isRemoteFailure()) throw e
+        SyncReport(listFailed = true)
+    }
+
+    private suspend fun processAll(
         ids: List<Int>,
+        staleIds: Set<Int>,
         onProgress: suspend (done: Int, total: Int) -> Unit = { _, _ -> },
     ): SyncReport {
-        var updated = 0
-        var failed = 0
+        val semaphore = Semaphore(CONCURRENCY)
+        val progressLock = Mutex()
+        var done = 0
         onProgress(0, ids.size)
-        ids.forEachIndexed { index, id ->
-            try {
+        val reports = coroutineScope {
+            ids.map { id ->
+                async {
+                    val report = semaphore.withPermit { processOne(id, needsDetails = id in staleIds) }
+                    progressLock.withLock {
+                        done++
+                        onProgress(done, ids.size)
+                    }
+                    report
+                }
+            }.awaitAll()
+        }
+        return reports.fold(SyncReport()) { acc, r -> acc + r }
+    }
+
+    private suspend fun processOne(id: Int, needsDetails: Boolean): SyncReport {
+        var report = SyncReport()
+        if (needsDetails) {
+            report = try {
                 val dto = api.getPokemon(id.toString())
-                dao.upsert(dto.toEntity(clock.now(), dao.getById(id)))
-                updated++
+                dao.saveDetail(dto.toEntity(clock.now(), dao.getById(id)), dto.toTypeEntities())
+                SyncReport(detailsUpdated = 1)
             } catch (e: Exception) {
                 if (!e.isRemoteFailure()) throw e
-                failed++
+                SyncReport(detailsFailed = 1)
             }
-            onProgress(index + 1, ids.size)
         }
-        return SyncReport(detailsUpdated = updated, detailsFailed = failed)
+        val missingImages = images.ensureCached(listOf(Sprites.sprite(id), Sprites.artwork(id)))
+        return report + SyncReport(imagesFailed = missingImages)
     }
 
     private suspend fun staleBefore(): Long {
@@ -105,5 +148,6 @@ class SyncEngine @Inject constructor(
 
     companion object {
         const val PERIODIC_LIST_SIZE = 50
+        const val CONCURRENCY = 8
     }
 }

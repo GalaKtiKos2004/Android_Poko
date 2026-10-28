@@ -6,13 +6,20 @@ import androidx.room.Index
 import androidx.room.PrimaryKey
 
 /**
- * Cache of API content. Not owned by any profile and never referenced by foreign keys,
+ * Cache of API content. Not owned by any profile and never referenced by user tables,
  * so clearing the cache can't cascade into user data.
  *
- * [types], [stats], [abilities] are null until the detail endpoint has been loaded.
- * types are stored as ",grass,poison," so a type filter is a simple LIKE.
+ * [catalogIndex] is the position in the server's `/pokemon` list (paging position).
+ * It is null for rows that came from search or from a type list and are not part of the
+ * contiguous catalogue — paging never depends on pokemon ids.
+ *
+ * [types] (display only, ",grass,poison,"), [stats], [abilities] are null until details are loaded.
+ * Filtering by type uses [PokemonTypeEntity], which is also filled from the lightweight type endpoint.
  */
-@Entity(tableName = "pokemon")
+@Entity(
+    tableName = "pokemon",
+    indices = [Index("catalogIndex")],
+)
 data class PokemonEntity(
     @PrimaryKey val id: Int,
     val name: String,
@@ -25,6 +32,34 @@ data class PokemonEntity(
     val abilities: String? = null,
     val listUpdatedAt: Long,
     val detailUpdatedAt: Long? = null,
+    val catalogIndex: Int? = null,
+)
+
+/** pokemon <-> type, filled from details and from `/type/{name}` (works without details). */
+@Entity(
+    tableName = "pokemon_types",
+    primaryKeys = ["pokemonId", "type"],
+    foreignKeys = [
+        ForeignKey(
+            entity = PokemonEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["pokemonId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [Index("type")],
+)
+data class PokemonTypeEntity(
+    val pokemonId: Int,
+    val type: String,
+    val slot: Int,
+)
+
+/** When the membership list of a type was last downloaded (TTL for the type index). */
+@Entity(tableName = "type_sync")
+data class TypeSyncEntity(
+    @PrimaryKey val type: String,
+    val updatedAt: Long,
 )
 
 @Entity(

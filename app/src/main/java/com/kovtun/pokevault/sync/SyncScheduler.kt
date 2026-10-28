@@ -15,6 +15,7 @@ import com.kovtun.pokevault.data.settings.SettingsRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import java.util.concurrent.TimeUnit
@@ -23,16 +24,31 @@ import javax.inject.Singleton
 
 sealed interface PrefetchProgress {
     data object Idle : PrefetchProgress
-    data object Queued : PrefetchProgress
-    data class Running(val done: Int, val total: Int) : PrefetchProgress
-    data class Finished(val updated: Int, val failed: Int) : PrefetchProgress
-    data object Failed : PrefetchProgress
+
+    /** Waiting for constraints (network / battery) or for a retry after a partial failure. */
+    data class Queued(val count: Int?, val retrying: Boolean) : PrefetchProgress
+    data class Running(val count: Int?, val done: Int, val total: Int) : PrefetchProgress
+    data class Finished(val updated: Int) : PrefetchProgress
+
+    /** Still incomplete after every retry: [failed] items are not available offline. */
+    data class Failed(val failed: Int) : PrefetchProgress
+}
+
+enum class PrefetchRequest {
+    /** Nothing was queued — a new job started. */
+    STARTED,
+
+    /** Same amount and same network rule are already queued / running — kept as is. */
+    ALREADY_RUNNING,
+
+    /** A job with other parameters was replaced; already downloaded data is kept and skipped. */
+    RESTARTED,
 }
 
 interface SyncScheduler {
     /** Keeps periodic work in line with settings for the whole app lifetime. */
     fun start()
-    fun prefetchNow(count: Int, wifiOnly: Boolean)
+    suspend fun prefetchNow(count: Int, wifiOnly: Boolean): PrefetchRequest
     fun observePrefetch(): Flow<PrefetchProgress>
 }
 
@@ -63,18 +79,31 @@ class WorkManagerSyncScheduler @Inject constructor(
         workManager.enqueueUniquePeriodicWork(SyncWorker.UNIQUE_NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
     }
 
-    override fun prefetchNow(count: Int, wifiOnly: Boolean) {
-        val request = OneTimeWorkRequestBuilder<PrefetchWorker>()
+    /**
+     * KEEP would silently ignore a request for another amount while a job is queued or running,
+     * so the policy is chosen explicitly: identical request -> keep, different -> REPLACE.
+     * Replacing loses nothing: every pokemon is saved as soon as it is downloaded and skipped next time.
+     */
+    override suspend fun prefetchNow(count: Int, wifiOnly: Boolean): PrefetchRequest {
+        val requestTags = setOf(PrefetchWorker.countTag(count), wifiTag(wifiOnly))
+        val active = workManager.getWorkInfosForUniqueWorkFlow(PrefetchWorker.UNIQUE_NAME)
+            .first()
+            .firstOrNull { !it.state.isFinished }
+        if (active != null && active.tags.containsAll(requestTags)) return PrefetchRequest.ALREADY_RUNNING
+
+        val builder = OneTimeWorkRequestBuilder<PrefetchWorker>()
             .setConstraints(constraints(wifiOnly))
             .setInputData(workDataOf(PrefetchWorker.KEY_COUNT to count))
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS)
-            .build()
-        workManager.enqueueUniqueWork(PrefetchWorker.UNIQUE_NAME, ExistingWorkPolicy.KEEP, request)
+        for (tag in requestTags) builder.addTag(tag)
+        val request = builder.build()
+        workManager.enqueueUniqueWork(PrefetchWorker.UNIQUE_NAME, ExistingWorkPolicy.REPLACE, request)
+        return if (active == null) PrefetchRequest.STARTED else PrefetchRequest.RESTARTED
     }
 
     override fun observePrefetch(): Flow<PrefetchProgress> =
         workManager.getWorkInfosForUniqueWorkFlow(PrefetchWorker.UNIQUE_NAME)
-            .map { infos -> infos.lastOrNull().toProgress() }
+            .map { infos -> (infos.firstOrNull { !it.state.isFinished } ?: infos.lastOrNull()).toProgress() }
             .distinctUntilChanged()
 
     private fun constraints(wifiOnly: Boolean) = Constraints.Builder()
@@ -82,21 +111,32 @@ class WorkManagerSyncScheduler @Inject constructor(
         .setRequiresBatteryNotLow(true)
         .build()
 
+    private fun wifiTag(wifiOnly: Boolean) = if (wifiOnly) "prefetch_wifi_only" else "prefetch_any_network"
+
     companion object {
         const val PERIOD_HOURS = 12L
     }
 }
 
-internal fun WorkInfo?.toProgress(): PrefetchProgress = when (this?.state) {
-    null, WorkInfo.State.CANCELLED -> PrefetchProgress.Idle
-    WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED -> PrefetchProgress.Queued
-    WorkInfo.State.RUNNING -> PrefetchProgress.Running(
-        done = progress.getInt(PrefetchWorker.KEY_DONE, 0),
-        total = progress.getInt(PrefetchWorker.KEY_TOTAL, 0),
-    )
-    WorkInfo.State.SUCCEEDED -> PrefetchProgress.Finished(
-        updated = outputData.getInt(PrefetchWorker.KEY_DONE, 0),
-        failed = outputData.getInt(PrefetchWorker.KEY_FAILED, 0),
-    )
-    WorkInfo.State.FAILED -> PrefetchProgress.Failed
+internal fun WorkInfo?.toProgress(): PrefetchProgress {
+    val info = this ?: return PrefetchProgress.Idle
+    val count = info.tags.firstNotNullOfOrNull { tag ->
+        tag.removePrefix("prefetch_count_").takeIf { tag.startsWith("prefetch_count_") }?.toIntOrNull()
+    }
+    return when (info.state) {
+        WorkInfo.State.CANCELLED -> PrefetchProgress.Idle
+        WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED ->
+            PrefetchProgress.Queued(count, retrying = info.runAttemptCount > 0)
+        WorkInfo.State.RUNNING -> PrefetchProgress.Running(
+            count = count,
+            done = info.progress.getInt(PrefetchWorker.KEY_DONE, 0),
+            total = info.progress.getInt(PrefetchWorker.KEY_TOTAL, 0),
+        )
+        WorkInfo.State.SUCCEEDED -> PrefetchProgress.Finished(
+            updated = info.outputData.getInt(PrefetchWorker.KEY_DONE, 0),
+        )
+        WorkInfo.State.FAILED -> PrefetchProgress.Failed(
+            failed = info.outputData.getInt(PrefetchWorker.KEY_FAILED, 0),
+        )
+    }
 }

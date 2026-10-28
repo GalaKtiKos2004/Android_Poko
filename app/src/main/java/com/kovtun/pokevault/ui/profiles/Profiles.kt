@@ -59,6 +59,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -66,11 +67,15 @@ data class ProfilesUiState(
     val isLoading: Boolean = true,
     val profiles: List<Profile> = emptyList(),
     val activeId: Long? = null,
+    /** Text of the "new profile" field; kept in the VM so a rejected name is not lost. */
+    val nameInput: String = "",
     val createError: String? = null,
+    val isCreating: Boolean = false,
 )
 
 sealed interface ProfilesEvent {
-    data class Create(val name: String) : ProfilesEvent
+    data class NameChanged(val name: String) : ProfilesEvent
+    data object Create : ProfilesEvent
     data class Select(val profileId: Long) : ProfilesEvent
     data class Delete(val profileId: Long) : ProfilesEvent
 }
@@ -81,37 +86,57 @@ class ProfilesViewModel @Inject constructor(
     private val session: SessionRepository,
 ) : ViewModel() {
 
-    private val createError = MutableStateFlow<String?>(null)
+    private data class Form(val name: String = "", val error: String? = null, val creating: Boolean = false)
+
+    private val form = MutableStateFlow(Form())
     private val _chosen = Channel<Long>(Channel.BUFFERED)
     /** Fires when a profile became active and the app can open the main section. */
     val chosen: Flow<Long> = _chosen.receiveAsFlow()
 
     val uiState: StateFlow<ProfilesUiState> =
-        combine(profiles.observeProfiles(), session.session, createError) { list, s, error ->
+        combine(profiles.observeProfiles(), session.session, form) { list, s, f ->
             ProfilesUiState(
                 isLoading = false,
                 profiles = list,
                 activeId = (s as? SessionState.Active)?.profile?.id,
-                createError = error,
+                nameInput = f.name,
+                createError = f.error,
+                isCreating = f.creating,
             )
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ProfilesUiState())
 
     fun onEvent(event: ProfilesEvent) {
+        when (event) {
+            is ProfilesEvent.NameChanged -> form.update { it.copy(name = event.name, error = null) }
+            ProfilesEvent.Create -> create()
+            else -> viewModelScope.launch { handle(event) }
+        }
+    }
+
+    /** The field is cleared only after the profile was really created. */
+    private fun create() {
+        val current = form.value
+        if (current.creating) return
+        form.update { it.copy(creating = true) }
         viewModelScope.launch {
-            when (event) {
-                is ProfilesEvent.Create -> profiles.createProfile(event.name)
-                    .onSuccess { id ->
-                        createError.value = null
-                        session.switchTo(id)
-                        _chosen.send(id)
-                    }
-                    .onFailure { createError.value = it.message }
-                is ProfilesEvent.Select -> {
-                    session.switchTo(event.profileId)
-                    _chosen.send(event.profileId)
+            profiles.createProfile(current.name)
+                .onSuccess { id ->
+                    form.value = Form()
+                    session.switchTo(id)
+                    _chosen.send(id)
                 }
-                is ProfilesEvent.Delete -> profiles.deleteProfile(event.profileId)
+                .onFailure { error -> form.update { it.copy(error = error.message, creating = false) } }
+        }
+    }
+
+    private suspend fun handle(event: ProfilesEvent) {
+        when (event) {
+            is ProfilesEvent.Select -> {
+                session.switchTo(event.profileId)
+                _chosen.send(event.profileId)
             }
+            is ProfilesEvent.Delete -> profiles.deleteProfile(event.profileId)
+            is ProfilesEvent.NameChanged, ProfilesEvent.Create -> Unit
         }
     }
 }
@@ -126,7 +151,6 @@ fun ProfilesRoute(onProfileChosen: () -> Unit, viewModel: ProfilesViewModel = hi
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfilesScreen(state: ProfilesUiState, onEvent: (ProfilesEvent) -> Unit) {
-    var name by rememberSaveable { mutableStateOf("") }
     var confirmDelete by rememberSaveable { mutableStateOf<Long?>(null) }
 
     Scaffold(topBar = { TopAppBar(title = { Text("Кто тренируется?") }) }) { padding ->
@@ -154,8 +178,8 @@ fun ProfilesScreen(state: ProfilesUiState, onEvent: (ProfilesEvent) -> Unit) {
             }
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
+                value = state.nameInput,
+                onValueChange = { onEvent(ProfilesEvent.NameChanged(it)) },
                 label = { Text("Имя нового профиля") },
                 isError = state.createError != null,
                 supportingText = state.createError?.let { { Text(it) } },
@@ -163,11 +187,8 @@ fun ProfilesScreen(state: ProfilesUiState, onEvent: (ProfilesEvent) -> Unit) {
                 modifier = Modifier.fillMaxWidth(),
             )
             Button(
-                onClick = {
-                    onEvent(ProfilesEvent.Create(name))
-                    name = ""
-                },
-                enabled = name.isNotBlank(),
+                onClick = { onEvent(ProfilesEvent.Create) },
+                enabled = state.nameInput.isNotBlank() && !state.isCreating,
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Создать профиль") }
         }

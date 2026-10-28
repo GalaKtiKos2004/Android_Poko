@@ -135,4 +135,31 @@ class DetailViewModelTest {
         advanceUntilIdle()
         assertEquals(false, vm.uiState.value.collections.single().selected)
     }
+
+    @Test
+    fun `a card that failed to load is not a view, the view is recorded once data arrives`() = runTest {
+        repository.detailResults += Result.failure(IOException("offline"))
+        repository.serverDetail = detail(25, "pikachu", updatedAt = clock.now)
+        val vm = createViewModel(25)
+        advanceUntilIdle()
+        assertTrue(vm.uiState.value.content is DetailContent.Error)
+        assertTrue("no data -> no history entry", history.views.isEmpty())
+
+        vm.onEvent(DetailEvent.Retry)
+        advanceUntilIdle()
+        vm.onEvent(DetailEvent.Refresh)
+        advanceUntilIdle()
+
+        assertEquals("exactly one view per opened card", listOf(1L to 25), history.views)
+    }
+
+    @Test
+    fun `cached card counts as a view even when the refresh fails offline`() = runTest {
+        repository.details.value = mapOf(25 to detail(25, "pikachu", updatedAt = clock.now))
+        repository.detailResults += Result.failure(IOException("offline"))
+        createViewModel(25)
+        advanceUntilIdle()
+
+        assertEquals(listOf(1L to 25), history.views)
+    }
 }

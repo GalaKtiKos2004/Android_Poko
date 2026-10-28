@@ -20,6 +20,9 @@ sealed interface RemoteSearch {
     data object Failed : RemoteSearch
 }
 
+/** Download of a type's member list (needed for the type filter on an incomplete cache). */
+enum class TypeIndexState { IDLE, LOADING, FAILED }
+
 sealed interface ListContent {
     data object Loading : ListContent
     data class Error(val message: String) : ListContent
@@ -39,6 +42,7 @@ data class PokedexUiState(
     val canLoadMore: Boolean = true,
     val isOffline: Boolean = false,
     val remoteSearch: RemoteSearch = RemoteSearch.Idle,
+    val typeIndex: TypeIndexState = TypeIndexState.IDLE,
 ) {
     /** Paging only makes sense for the unfiltered national dex. */
     val showLoadMore: Boolean
@@ -66,9 +70,12 @@ object PokedexReducer {
         network: NetworkState,
         remote: RemoteSearch,
         filtered: Boolean,
+        typeIndex: TypeIndexState = TypeIndexState.IDLE,
     ): ListContent = when {
         items.isNotEmpty() -> ListContent.Success(items)
-        network is NetworkState.Loading || remote is RemoteSearch.Searching -> ListContent.Loading
+        network is NetworkState.Loading ||
+            remote is RemoteSearch.Searching ||
+            typeIndex == TypeIndexState.LOADING -> ListContent.Loading
         network is NetworkState.Error && !filtered -> ListContent.Error(network.message)
         else -> ListContent.Empty(filtered)
     }

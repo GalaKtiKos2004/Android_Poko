@@ -12,6 +12,7 @@ import com.kovtun.pokevault.domain.CatchStatus
 import com.kovtun.pokevault.domain.FilterPreset
 import com.kovtun.pokevault.domain.PokemonFilter
 import com.kovtun.pokevault.domain.PokemonSummary
+import com.kovtun.pokevault.domain.SearchQuery
 import com.kovtun.pokevault.domain.SessionRepository
 import com.kovtun.pokevault.domain.activeProfileId
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -34,6 +35,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.shareIn
@@ -48,6 +50,8 @@ import javax.inject.Inject
  *  - active profile                             — session (DataStore + Room)
  *  - list from Room joined with profile statuses — data layer
  *  - remote lookup (flatMapLatest, cancels stale requests)
+ *  - type index download for the type filter (flatMapLatest)
+ *  - catalogue paging position from Room (canLoadMore is derived, never cached in the VM)
  *  - refresh/retry actions (SharedFlow) and their network state
  *  - connectivity (auto-retry on reconnect, offline banner)
  *  - saved presets, profile default sort        — Room / DataStore
@@ -65,12 +69,14 @@ class PokedexViewModel @Inject constructor(
 
     private enum class RefreshRequest { INITIAL, USER, RETRY }
 
+    private data class TypeRequest(val type: String?, val force: Boolean)
+
     private val queryInput = MutableStateFlow("")
     private val filterInput = MutableStateFlow(PokemonFilter())
     private val refreshRequests = MutableSharedFlow<RefreshRequest>(extraBufferCapacity = 8)
     private val network = MutableStateFlow<NetworkState>(NetworkState.Loading)
     private val loadingMore = MutableStateFlow(false)
-    private val canLoadMore = MutableStateFlow(true)
+    private val typeRefresh = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
 
     private val _messages = Channel<String>(Channel.BUFFERED)
     /** One-time messages (snackbar). Kept out of the state on purpose. */
@@ -81,7 +87,7 @@ class PokedexViewModel @Inject constructor(
 
     private val debouncedQuery: Flow<String> = queryInput
         .debounce { if (it.isBlank()) 0L else SEARCH_DEBOUNCE_MS }
-        .map { it.trim().lowercase() }
+        .map { SearchQuery.normalize(it) }
         .distinctUntilChanged()
 
     private val effectiveFilter: Flow<PokemonFilter> =
@@ -94,7 +100,7 @@ class PokedexViewModel @Inject constructor(
 
     /** A newer query cancels the previous server lookup (flatMapLatest). */
     private val remoteSearch: Flow<RemoteSearch> = debouncedQuery.flatMapLatest { query ->
-        if (query.length < MIN_REMOTE_QUERY) {
+        if (!SearchQuery.isRemoteLookupAllowed(query)) {
             flowOf<RemoteSearch>(RemoteSearch.Idle)
         } else {
             flow<RemoteSearch> {
@@ -114,13 +120,36 @@ class PokedexViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Selecting a type downloads its member list, so the filter is complete even when details
+     * of most pokemon were never loaded. A new type (or refresh) cancels the previous download.
+     */
+    private val typeIndex: Flow<TypeIndexState> = merge(
+        filterInput.map { it.type }.distinctUntilChanged().map { TypeRequest(it, force = false) },
+        typeRefresh.map { TypeRequest(filterInput.value.type, force = true) },
+    ).flatMapLatest { request ->
+        val type = request.type
+        if (type == null) {
+            flowOf<TypeIndexState>(TypeIndexState.IDLE)
+        } else {
+            flow<TypeIndexState> {
+                emit(TypeIndexState.LOADING)
+                val result = pokemonRepository.refreshType(type, request.force)
+                emit(if (result.isSuccess) TypeIndexState.IDLE else TypeIndexState.FAILED)
+            }
+        }
+    }
+
+    private val canLoadMore: Flow<Boolean> =
+        pokemonRepository.observeCatalog().map { it.canLoadMore }.distinctUntilChanged()
+
     private val statuses: Flow<Map<Int, CatchStatus>> =
         profileId.flatMapLatest { userPokemonRepository.observeStatuses(it) }
 
     private val presets: Flow<List<FilterPreset>> =
         profileId.flatMapLatest { presetRepository.observe(it) }
 
-    private data class ListPart(val content: ListContent, val remote: RemoteSearch)
+    private data class ListPart(val content: ListContent, val remote: RemoteSearch, val typeIndex: TypeIndexState)
 
     private data class Extras(
         val statuses: Map<Int, CatchStatus>,
@@ -131,8 +160,12 @@ class PokedexViewModel @Inject constructor(
     )
 
     private val listPart: Flow<ListPart> =
-        combine(items, network, remoteSearch, effectiveFilter) { list, net, remote, filter ->
-            ListPart(PokedexReducer.content(list, net, remote, filtered = !filter.isDefault), remote)
+        combine(items, network, remoteSearch, typeIndex, effectiveFilter) { list, net, remote, typeState, filter ->
+            ListPart(
+                content = PokedexReducer.content(list, net, remote, filtered = !filter.isDefault, typeIndex = typeState),
+                remote = remote,
+                typeIndex = typeState,
+            )
         }
 
     private val extras: Flow<Extras> =
@@ -148,13 +181,15 @@ class PokedexViewModel @Inject constructor(
                 content = list.content,
                 statuses = extra.statuses,
                 presets = extra.presets,
-                isRefreshing = net is NetworkState.Loading && list.content is ListContent.Success,
+                isRefreshing = (net is NetworkState.Loading || list.typeIndex == TypeIndexState.LOADING) &&
+                    list.content is ListContent.Success,
                 refreshError = (net as? NetworkState.Error)?.message
                     ?.takeIf { list.content is ListContent.Success },
                 isLoadingMore = extra.loadingMore,
                 canLoadMore = extra.canLoadMore,
                 isOffline = !extra.online,
                 remoteSearch = list.remote,
+                typeIndex = list.typeIndex,
             )
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PokedexUiState())
 
@@ -202,8 +237,14 @@ class PokedexViewModel @Inject constructor(
                 queryInput.value = ""
                 filterInput.update { PokemonFilter(sort = it.sort) }
             }
-            PokedexEvent.Refresh -> refreshRequests.tryEmit(RefreshRequest.USER)
-            PokedexEvent.Retry -> refreshRequests.tryEmit(RefreshRequest.RETRY)
+            PokedexEvent.Refresh -> {
+                refreshRequests.tryEmit(RefreshRequest.USER)
+                if (filterInput.value.type != null) typeRefresh.tryEmit(Unit)
+            }
+            PokedexEvent.Retry -> {
+                refreshRequests.tryEmit(RefreshRequest.RETRY)
+                if (filterInput.value.type != null) typeRefresh.tryEmit(Unit)
+            }
             PokedexEvent.LoadMore -> loadMore()
             is PokedexEvent.ApplyPreset -> {
                 queryInput.value = event.preset.filter.query
@@ -214,12 +255,12 @@ class PokedexViewModel @Inject constructor(
         }
     }
 
+    /** The repository computes the offset from Room and knows when the catalogue is complete. */
     private fun loadMore() {
-        if (loadingMore.value || !canLoadMore.value) return
+        if (loadingMore.value) return
         loadingMore.value = true
         viewModelScope.launch {
             pokemonRepository.loadNextPage()
-                .onSuccess { hasMore -> canLoadMore.value = hasMore }
                 .onFailure { _messages.send(it.toUserMessage()) }
             loadingMore.value = false
         }
@@ -237,6 +278,5 @@ class PokedexViewModel @Inject constructor(
 
     companion object {
         const val SEARCH_DEBOUNCE_MS = 400L
-        const val MIN_REMOTE_QUERY = 3
     }
 }

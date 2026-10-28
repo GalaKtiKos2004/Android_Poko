@@ -114,3 +114,38 @@ class MappersTest {
         assertEquals(PokemonFilter(query = "pi", type = "fire", status = null, sort = SortOrder.ID), preset.filter)
     }
 }
+
+class SearchQueryTest {
+
+    @Test
+    fun `number with hash and leading zeros is the same as the plain number`() {
+        assertEquals("25", SearchQuery.normalize("#025"))
+        assertEquals("25", SearchQuery.normalize(" 025 "))
+        assertEquals("25", SearchQuery.normalize("# 25"))
+        assertEquals("0", SearchQuery.normalize("000"))
+    }
+
+    @Test
+    fun `names are lowercased and spaces become dashes like in the API`() {
+        assertEquals("mr-mime", SearchQuery.normalize("  Mr   Mime "))
+        assertEquals("", SearchQuery.normalize("   "))
+    }
+
+    @Test
+    fun `short numbers may be looked up on the server, short names may not`() {
+        assertTrue(SearchQuery.isRemoteLookupAllowed("7"))
+        assertTrue(SearchQuery.isRemoteLookupAllowed("pik"))
+        assertFalse(SearchQuery.isRemoteLookupAllowed("pi"))
+        assertFalse(SearchQuery.isRemoteLookupAllowed("0"))
+    }
+}
+
+class CatalogStateTest {
+
+    @Test
+    fun `more pages exist until the stored prefix reaches the server total`() {
+        assertTrue(CatalogState(loaded = 0, total = null).canLoadMore)
+        assertTrue(CatalogState(loaded = 50, total = 120).canLoadMore)
+        assertFalse(CatalogState(loaded = 120, total = 120).canLoadMore)
+    }
+}

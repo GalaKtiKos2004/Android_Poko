@@ -7,6 +7,8 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.preferencesDataStoreFile
 import androidx.room.Room
 import androidx.work.WorkManager
+import coil.ImageLoader
+import coil.disk.DiskCache
 import com.kovtun.pokevault.BuildConfig
 import com.kovtun.pokevault.core.AndroidConnectivityObserver
 import com.kovtun.pokevault.core.ApplicationScope
@@ -37,6 +39,8 @@ import com.kovtun.pokevault.data.repository.UserPokemonRepository
 import com.kovtun.pokevault.data.settings.DataStoreSettingsRepository
 import com.kovtun.pokevault.data.settings.SettingsRepository
 import com.kovtun.pokevault.domain.SessionRepository
+import com.kovtun.pokevault.sync.CoilImagePrefetcher
+import com.kovtun.pokevault.sync.ImagePrefetcher
 import com.kovtun.pokevault.sync.SyncScheduler
 import com.kovtun.pokevault.sync.WorkManagerSyncScheduler
 import dagger.Binds
@@ -127,7 +131,9 @@ object DatabaseModule {
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): PokeVaultDatabase =
-        Room.databaseBuilder(context, PokeVaultDatabase::class.java, PokeVaultDatabase.NAME).build()
+        Room.databaseBuilder(context, PokeVaultDatabase::class.java, PokeVaultDatabase.NAME)
+            .addMigrations(*PokeVaultDatabase.MIGRATIONS)
+            .build()
 
     @Provides fun providePokemonDao(db: PokeVaultDatabase): PokemonDao = db.pokemonDao()
     @Provides fun provideProfileDao(db: PokeVaultDatabase): ProfileDao = db.profileDao()
@@ -150,4 +156,32 @@ abstract class BindingsModule {
     @Binds abstract fun bindPresets(impl: RoomPresetRepository): PresetRepository
     @Binds abstract fun bindConnectivity(impl: AndroidConnectivityObserver): ConnectivityObserver
     @Binds abstract fun bindSyncScheduler(impl: WorkManagerSyncScheduler): SyncScheduler
+    @Binds abstract fun bindImagePrefetcher(impl: CoilImagePrefetcher): ImagePrefetcher
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+object ImageModule {
+
+    /**
+     * One ImageLoader for the UI and for offline prefetch, so prefetched images are exactly the
+     * ones AsyncImage reads. The disk cache lives in filesDir (the system doesn't evict it like
+     * cacheDir) and ignores HTTP cache headers: sprites never change, and an image must be shown
+     * offline even after the server's max-age has passed.
+     */
+    @Provides
+    @Singleton
+    fun provideImageLoader(@ApplicationContext context: Context, okHttp: OkHttpClient): ImageLoader =
+        ImageLoader.Builder(context)
+            .okHttpClient(okHttp)
+            .respectCacheHeaders(false)
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(context.filesDir.resolve("image_cache"))
+                    .maxSizeBytes(IMAGE_CACHE_BYTES)
+                    .build()
+            }
+            .build()
+
+    private const val IMAGE_CACHE_BYTES = 300L * 1024 * 1024
 }

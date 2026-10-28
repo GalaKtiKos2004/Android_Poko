@@ -5,7 +5,6 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
-import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -95,22 +94,64 @@ interface CollectionDao {
     suspend fun updateItemNote(collectionId: Long, pokemonId: Int, note: String)
 }
 
+/**
+ * Status and note are written with column-level statements inside one transaction, so a status
+ * change and a note save that happen at the same time can't overwrite each other's field.
+ */
 @Dao
-interface UserPokemonDao {
+abstract class UserPokemonDao {
     @Query("SELECT * FROM user_pokemon WHERE profileId = :profileId AND pokemonId = :pokemonId")
-    fun observe(profileId: Long, pokemonId: Int): Flow<UserPokemonEntity?>
+    abstract fun observe(profileId: Long, pokemonId: Int): Flow<UserPokemonEntity?>
 
     @Query("SELECT * FROM user_pokemon WHERE profileId = :profileId AND pokemonId = :pokemonId")
-    suspend fun get(profileId: Long, pokemonId: Int): UserPokemonEntity?
+    abstract suspend fun get(profileId: Long, pokemonId: Int): UserPokemonEntity?
 
     @Query("SELECT * FROM user_pokemon WHERE profileId = :profileId AND status != 'NONE'")
-    fun observeWithStatus(profileId: Long): Flow<List<UserPokemonEntity>>
+    abstract fun observeWithStatus(profileId: Long): Flow<List<UserPokemonEntity>>
 
-    @Upsert
-    suspend fun upsert(entity: UserPokemonEntity)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    abstract suspend fun insertIgnore(entity: UserPokemonEntity): Long
 
-    @Query("DELETE FROM user_pokemon WHERE profileId = :profileId AND pokemonId = :pokemonId")
-    suspend fun delete(profileId: Long, pokemonId: Int)
+    @Query(
+        """
+        UPDATE user_pokemon SET status = :status, updatedAt = :now
+        WHERE profileId = :profileId AND pokemonId = :pokemonId
+        """,
+    )
+    abstract suspend fun updateStatusColumn(profileId: Long, pokemonId: Int, status: String, now: Long)
+
+    @Query(
+        """
+        UPDATE user_pokemon SET note = :note, updatedAt = :now
+        WHERE profileId = :profileId AND pokemonId = :pokemonId
+        """,
+    )
+    abstract suspend fun updateNoteColumn(profileId: Long, pokemonId: Int, note: String, now: Long)
+
+    /** A row with no status and no note carries no information. */
+    @Query(
+        """
+        DELETE FROM user_pokemon
+        WHERE profileId = :profileId AND pokemonId = :pokemonId AND status = 'NONE' AND note = ''
+        """,
+    )
+    abstract suspend fun deleteIfEmpty(profileId: Long, pokemonId: Int)
+
+    @Transaction
+    open suspend fun setStatus(profileId: Long, pokemonId: Int, status: String, now: Long) {
+        if (insertIgnore(UserPokemonEntity(profileId, pokemonId, status, note = "", updatedAt = now)) == -1L) {
+            updateStatusColumn(profileId, pokemonId, status, now)
+        }
+        deleteIfEmpty(profileId, pokemonId)
+    }
+
+    @Transaction
+    open suspend fun setNote(profileId: Long, pokemonId: Int, note: String, now: Long) {
+        if (insertIgnore(UserPokemonEntity(profileId, pokemonId, status = "NONE", note = note, updatedAt = now)) == -1L) {
+            updateNoteColumn(profileId, pokemonId, note, now)
+        }
+        deleteIfEmpty(profileId, pokemonId)
+    }
 }
 
 @Dao

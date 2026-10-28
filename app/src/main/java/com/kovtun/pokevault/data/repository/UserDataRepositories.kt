@@ -12,7 +12,6 @@ import com.kovtun.pokevault.data.local.HistoryDao
 import com.kovtun.pokevault.data.local.ProfileDao
 import com.kovtun.pokevault.data.local.ProfileEntity
 import com.kovtun.pokevault.data.local.UserPokemonDao
-import com.kovtun.pokevault.data.local.UserPokemonEntity
 import com.kovtun.pokevault.data.mapper.toCatchStatus
 import com.kovtun.pokevault.data.mapper.toDomain
 import com.kovtun.pokevault.data.settings.SettingsRepository
@@ -74,8 +73,8 @@ class RoomProfileRepository @Inject constructor(
     override suspend fun deleteProfile(profileId: Long) = withContext(io) {
         dao.delete(profileId)
         settings.clearProfile(profileId)
-        // If it was the active profile, the session switches to NoProfile automatically:
-        // observeById emits null and [session] maps that to NoProfile.
+        // Don't leave a dangling reference to the deleted profile in DataStore.
+        settings.clearActiveProfileIf(profileId)
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -206,22 +205,11 @@ class RoomUserPokemonRepository @Inject constructor(
             .distinctUntilChanged()
 
     override suspend fun setStatus(profileId: Long, pokemonId: Int, status: CatchStatus) = withContext(io) {
-        val current = dao.get(profileId, pokemonId)
-        write(profileId, pokemonId, status, current?.note.orEmpty())
+        dao.setStatus(profileId, pokemonId, status.name, clock.now())
     }
 
     override suspend fun setNote(profileId: Long, pokemonId: Int, note: String) = withContext(io) {
-        val current = dao.get(profileId, pokemonId)
-        write(profileId, pokemonId, current?.status.toCatchStatus(), note.trim())
-    }
-
-    /** An entry with no status and no note carries no information, so it is removed. */
-    private suspend fun write(profileId: Long, pokemonId: Int, status: CatchStatus, note: String) {
-        if (status == CatchStatus.NONE && note.isEmpty()) {
-            dao.delete(profileId, pokemonId)
-        } else {
-            dao.upsert(UserPokemonEntity(profileId, pokemonId, status.name, note, clock.now()))
-        }
+        dao.setNote(profileId, pokemonId, note.trim(), clock.now())
     }
 }
 

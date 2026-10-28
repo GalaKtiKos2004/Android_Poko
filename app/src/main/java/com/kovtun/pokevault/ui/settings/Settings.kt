@@ -47,6 +47,7 @@ import com.kovtun.pokevault.domain.SessionRepository
 import com.kovtun.pokevault.domain.SessionState
 import com.kovtun.pokevault.domain.SortOrder
 import com.kovtun.pokevault.sync.PrefetchProgress
+import com.kovtun.pokevault.sync.PrefetchRequest
 import com.kovtun.pokevault.sync.SyncScheduler
 import com.kovtun.pokevault.ui.components.relativeTime
 import com.kovtun.pokevault.ui.profiles.Avatar
@@ -143,8 +144,13 @@ class SettingsViewModel @Inject constructor(
                 is SettingsEvent.SetPrefetchCount -> settings.setPrefetchCount(event.count)
                 SettingsEvent.PrefetchNow -> {
                     val app = settings.appSettings.first()
-                    scheduler.prefetchNow(app.prefetchCount, app.wifiOnly)
-                    _messages.send("Загрузка для офлайна поставлена в очередь")
+                    val message = when (scheduler.prefetchNow(app.prefetchCount, app.wifiOnly)) {
+                        PrefetchRequest.STARTED -> "Загрузка первых ${app.prefetchCount} поставлена в очередь"
+                        PrefetchRequest.ALREADY_RUNNING -> "Загрузка первых ${app.prefetchCount} уже идёт"
+                        PrefetchRequest.RESTARTED ->
+                            "Загрузка перезапущена: первые ${app.prefetchCount} (скачанное сохранено)"
+                    }
+                    _messages.send(message)
                 }
                 SettingsEvent.ClearCache -> {
                     val removed = pokemonRepository.clearCache()
@@ -253,19 +259,29 @@ private fun OfflineSection(state: SettingsUiState, onEvent: (SettingsEvent) -> U
         )
         when (val p = state.prefetch) {
             is PrefetchProgress.Running -> {
-                Text("Загрузка: ${p.done} / ${p.total}", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "Загрузка" + (p.count?.let { " первых $it" } ?: "") + ": ${p.done} / ${p.total}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 LinearProgressIndicator(
                     progress = { if (p.total == 0) 0f else p.done.toFloat() / p.total },
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
-            PrefetchProgress.Queued -> Text("Ожидает сети / заряда…", style = MaterialTheme.typography.bodySmall)
-            is PrefetchProgress.Finished -> Text(
-                "Готово: обновлено ${p.updated}" + if (p.failed > 0) ", ошибок ${p.failed}" else "",
+            is PrefetchProgress.Queued -> Text(
+                if (p.retrying) {
+                    "Скачалось не всё — повтор после паузы…"
+                } else {
+                    "Ожидает сети / заряда…"
+                },
                 style = MaterialTheme.typography.bodySmall,
             )
-            PrefetchProgress.Failed -> Text(
-                "Не удалось скачать — проверьте сеть",
+            is PrefetchProgress.Finished -> Text(
+                "Готово: всё доступно без сети (обновлено ${p.updated})",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            is PrefetchProgress.Failed -> Text(
+                "Скачано не полностью: не удалось загрузить ${p.failed}. Проверьте сеть и повторите",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -273,8 +289,8 @@ private fun OfflineSection(state: SettingsUiState, onEvent: (SettingsEvent) -> U
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
+                // Always enabled: pressing with another amount restarts the job with it.
                 onClick = { onEvent(SettingsEvent.PrefetchNow) },
-                enabled = state.prefetch !is PrefetchProgress.Running && state.prefetch != PrefetchProgress.Queued,
             ) { Text("Скачать сейчас") }
             OutlinedButton(onClick = { onEvent(SettingsEvent.ClearCache) }) { Text("Очистить кэш") }
         }
@@ -302,10 +318,18 @@ private fun SyncSection(app: AppSettings, onEvent: (SettingsEvent) -> Unit) {
             onChange = { onEvent(SettingsEvent.SetWifiOnly(it)) },
         )
         Text(
-            "Последняя синхронизация: " + (app.lastSyncAt?.let { relativeTime(it) } ?: "ещё не было"),
+            "Последняя полная синхронизация: " + (app.lastSyncAt?.let { relativeTime(it) } ?: "ещё не было"),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (app.lastAttemptIncomplete) {
+            Text(
+                "Последняя попытка ${relativeTime(app.lastSyncAttemptAt!!)} обновила не всё " +
+                    "(ошибок: ${app.lastSyncFailures}) — будет повтор",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
     }
 }
 

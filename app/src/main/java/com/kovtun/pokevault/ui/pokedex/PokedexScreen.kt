@@ -103,6 +103,9 @@ fun PokedexScreen(
             FiltersBar(state, onEvent)
             if (state.isOffline) OfflineBanner()
             state.refreshError?.let { OfflineBanner(text = "Не удалось обновить: $it") }
+            if (state.typeIndex == TypeIndexState.FAILED && state.content is ListContent.Success) {
+                OfflineBanner(text = "Список этого типа может быть неполным: не удалось загрузить его с сервера")
+            }
 
             PullToRefreshBox(
                 isRefreshing = state.isRefreshing,
@@ -232,10 +235,13 @@ private fun PresetDeleteRow(state: PokedexUiState, onEvent: (PokedexEvent) -> Un
 
 @Composable
 private fun EmptyContent(state: PokedexUiState, filtered: Boolean, onEvent: (PokedexEvent) -> Unit) {
-    val subtitle = when (state.remoteSearch) {
-        RemoteSearch.NotFound -> "На сервере такого покемона тоже нет"
-        RemoteSearch.Failed -> "Поиск на сервере недоступен без сети"
-        else -> if (filtered) "Попробуйте изменить фильтры" else "Потяните вниз, чтобы загрузить"
+    val subtitle = when {
+        state.remoteSearch == RemoteSearch.NotFound -> "На сервере такого покемона тоже нет"
+        state.remoteSearch == RemoteSearch.Failed -> "Поиск на сервере недоступен без сети"
+        state.typeIndex == TypeIndexState.FAILED ->
+            "Список покемонов этого типа ещё не скачан, а сети нет. Показаны только сохранённые"
+        filtered -> "Попробуйте изменить фильтры"
+        else -> "Потяните вниз, чтобы загрузить"
     }
     EmptyState(
         title = if (filtered) "Ничего не найдено" else "Список пуст",

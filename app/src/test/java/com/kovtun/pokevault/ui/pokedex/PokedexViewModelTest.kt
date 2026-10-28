@@ -1,6 +1,7 @@
 package com.kovtun.pokevault.ui.pokedex
 
 import app.cash.turbine.test
+import com.kovtun.pokevault.domain.CatalogState
 import com.kovtun.pokevault.domain.CatchStatus
 import com.kovtun.pokevault.domain.PokemonFilter
 import com.kovtun.pokevault.testutil.FakeConnectivity
@@ -229,6 +230,90 @@ class PokedexViewModelTest {
 
         assertEquals("char", vm.uiState.value.query)
         assertEquals(PokemonFilter(type = "fire"), vm.uiState.value.filter)
+        assertEquals(listOf(4), vm.uiState.value.ids())
+    }
+
+    @Test
+    fun `number with hash and zeros finds the cached pokemon and does not go to the server`() = runTest {
+        repository.serverItems = pokemon
+        val vm = createViewModel()
+        collectState(vm)
+        advanceUntilIdle()
+
+        vm.onEvent(PokedexEvent.QueryChanged("#025"))
+        advanceUntilIdle()
+
+        assertEquals("25", repository.observedFilters.last().query)
+        assertEquals(listOf(25), vm.uiState.value.ids())
+        assertTrue("local match must not trigger a lookup", repository.remoteStarted.isEmpty())
+    }
+
+    @Test
+    fun `short number not in cache is looked up on the server in normalised form`() = runTest {
+        repository.serverItems = pokemon
+        val vm = createViewModel()
+        collectState(vm)
+        advanceUntilIdle()
+
+        vm.onEvent(PokedexEvent.QueryChanged("#007"))
+        advanceUntilIdle()
+
+        assertEquals(listOf("7"), repository.remoteStarted)
+    }
+
+    @Test
+    fun `load more button follows the catalogue state, also after the cache was cleared`() = runTest {
+        repository.serverItems = pokemon
+        repository.catalog.value = CatalogState(loaded = 3, total = 3)
+        val vm = createViewModel()
+        collectState(vm)
+        advanceUntilIdle()
+        assertFalse("end of the catalogue", vm.uiState.value.showLoadMore)
+
+        // Cache cleared and first page reloaded: the stored prefix is shorter than the total again.
+        repository.catalog.value = CatalogState(loaded = 50, total = 1000)
+        advanceUntilIdle()
+        assertTrue(vm.uiState.value.showLoadMore)
+
+        vm.onEvent(PokedexEvent.LoadMore)
+        advanceUntilIdle()
+        assertEquals(1, repository.loadNextCalls)
+    }
+
+    @Test
+    fun `type filter downloads the type list so pokemon without details are found`() = runTest {
+        // Cached catalogue has no details, so no types are known locally.
+        repository.serverItems = listOf(summary(1, "bulbasaur"), summary(4, "charmander"), summary(6, "charizard"))
+        repository.typeServer = mapOf("fire" to listOf(summary(4, "charmander"), summary(6, "charizard")))
+        val vm = createViewModel()
+        collectState(vm)
+        advanceUntilIdle()
+
+        vm.onEvent(PokedexEvent.TypeSelected("fire"))
+        advanceUntilIdle()
+
+        assertEquals(listOf("fire" to false), repository.typeCalls)
+        assertEquals(listOf(4, 6), vm.uiState.value.ids())
+        assertEquals(TypeIndexState.IDLE, vm.uiState.value.typeIndex)
+    }
+
+    @Test
+    fun `type list that could not be downloaded gives Empty with FAILED, refresh forces a new attempt`() = runTest {
+        repository.serverItems = listOf(summary(4, "charmander"))
+        repository.typeServer = mapOf("fire" to listOf(summary(4, "charmander")))
+        repository.typeResults += Result.failure(IOException("offline"))
+        val vm = createViewModel()
+        collectState(vm)
+        advanceUntilIdle()
+
+        vm.onEvent(PokedexEvent.TypeSelected("fire"))
+        advanceUntilIdle()
+        assertEquals(ListContent.Empty(filtered = true), vm.uiState.value.content)
+        assertEquals(TypeIndexState.FAILED, vm.uiState.value.typeIndex)
+
+        vm.onEvent(PokedexEvent.Refresh)
+        advanceUntilIdle()
+        assertEquals(listOf("fire" to false, "fire" to true), repository.typeCalls)
         assertEquals(listOf(4), vm.uiState.value.ids())
     }
 }

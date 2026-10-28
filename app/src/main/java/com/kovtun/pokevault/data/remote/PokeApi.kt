@@ -16,6 +16,10 @@ interface PokeApi {
     @GET("pokemon/{idOrName}")
     suspend fun getPokemon(@Path("idOrName") idOrName: String): PokemonDetailDto
 
+    /** All pokemon of a type — lets the type filter work before details are downloaded. */
+    @GET("type/{name}")
+    suspend fun getType(@Path("name") name: String): TypeDetailDto
+
     companion object {
         const val BASE_URL = "https://pokeapi.co/api/v2/"
     }

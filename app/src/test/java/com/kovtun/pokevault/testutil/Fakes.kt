@@ -7,17 +7,21 @@ import com.kovtun.pokevault.data.remote.PokeApi
 import com.kovtun.pokevault.data.remote.PokemonDetailDto
 import com.kovtun.pokevault.data.remote.PokemonListResponseDto
 import com.kovtun.pokevault.data.remote.StatDto
+import com.kovtun.pokevault.data.remote.TypeDetailDto
+import com.kovtun.pokevault.data.remote.TypePokemonDto
 import com.kovtun.pokevault.data.remote.TypeSlotDto
 import com.kovtun.pokevault.data.repository.CollectionRepository
 import com.kovtun.pokevault.data.repository.HistoryRepository
 import com.kovtun.pokevault.data.repository.PokemonRepository
 import com.kovtun.pokevault.data.repository.PresetRepository
+import com.kovtun.pokevault.data.repository.ProfileRepository
 import com.kovtun.pokevault.data.repository.UserPokemonRepository
 import com.kovtun.pokevault.data.settings.AppSettings
 import com.kovtun.pokevault.data.settings.ProfileSettings
 import com.kovtun.pokevault.data.settings.SettingsRepository
 import com.kovtun.pokevault.data.settings.ThemeMode
 import com.kovtun.pokevault.domain.CacheStats
+import com.kovtun.pokevault.domain.CatalogState
 import com.kovtun.pokevault.domain.CatchStatus
 import com.kovtun.pokevault.domain.CollectionItem
 import com.kovtun.pokevault.domain.FilterPreset
@@ -28,10 +32,12 @@ import com.kovtun.pokevault.domain.PokemonDetail
 import com.kovtun.pokevault.domain.PokemonFilter
 import com.kovtun.pokevault.domain.PokemonSummary
 import com.kovtun.pokevault.domain.Profile
+import com.kovtun.pokevault.domain.SearchQuery
 import com.kovtun.pokevault.domain.SessionRepository
 import com.kovtun.pokevault.domain.SessionState
 import com.kovtun.pokevault.domain.SortOrder
 import com.kovtun.pokevault.domain.UserPokemonState
+import com.kovtun.pokevault.sync.ImagePrefetcher
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -43,6 +49,8 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import retrofit2.HttpException
 import retrofit2.Response
 import java.io.IOException
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 
 class FakeClock(var now: Long = 1_000_000_000L) : TimeProvider {
     override fun now(): Long = now
@@ -83,11 +91,21 @@ class FakeSettingsRepository : SettingsRepository {
         perProfile.update { it + (profileId to block(it[profileId] ?: ProfileSettings())) }
 
     override suspend fun setActiveProfile(profileId: Long?) { active.value = profileId }
+    override suspend fun clearActiveProfileIf(profileId: Long) {
+        active.update { if (it == profileId) null else it }
+    }
+    override suspend fun setCatalogTotal(total: Int) = app.update { it.copy(catalogTotal = total) }
+    override suspend fun recordSyncAttempt(time: Long, failures: Int) = app.update {
+        it.copy(
+            lastSyncAttemptAt = time,
+            lastSyncFailures = failures,
+            lastSyncAt = if (failures == 0) time else it.lastSyncAt,
+        )
+    }
     override suspend fun setCacheTtlHours(hours: Int) = app.update { it.copy(cacheTtlHours = hours) }
     override suspend fun setBackgroundSync(enabled: Boolean) = app.update { it.copy(backgroundSync = enabled) }
     override suspend fun setWifiOnly(enabled: Boolean) = app.update { it.copy(wifiOnly = enabled) }
     override suspend fun setPrefetchCount(count: Int) = app.update { it.copy(prefetchCount = count) }
-    override suspend fun setLastSyncAt(time: Long) = app.update { it.copy(lastSyncAt = time) }
     override suspend fun setLastListRefreshAt(time: Long?) = app.update { it.copy(lastListRefreshAt = time) }
     override suspend fun setTheme(profileId: Long, mode: ThemeMode) = edit(profileId) { it.copy(theme = mode) }
     override suspend fun setDefaultSort(profileId: Long, sort: SortOrder) = edit(profileId) { it.copy(defaultSort = sort) }
@@ -114,6 +132,13 @@ class FakePokemonRepository(
 ) : PokemonRepository {
     val all = MutableStateFlow<List<PokemonSummary>>(emptyList())
     val details = MutableStateFlow<Map<Int, PokemonDetail>>(emptyMap())
+    val catalog = MutableStateFlow(CatalogState(loaded = 0, total = null))
+
+    /** type -> ids, filled by [refreshType] (like the pokemon_types table). */
+    val typeMembers = MutableStateFlow<Map<String, Set<Int>>>(emptyMap())
+    var typeServer: Map<String, List<PokemonSummary>> = emptyMap()
+    val typeResults = ArrayDeque<Result<Boolean>>()
+    val typeCalls = mutableListOf<Pair<String, Boolean>>()
 
     /** Items that appear in [all] when a refresh succeeds. */
     var serverItems: List<PokemonSummary> = emptyList()
@@ -121,6 +146,8 @@ class FakePokemonRepository(
     var refreshCalls = 0
         private set
     var refreshGate: CompletableDeferred<Unit>? = null
+    var loadNextCalls = 0
+        private set
 
     val observedFilters = mutableListOf<PokemonFilter>()
 
@@ -135,11 +162,12 @@ class FakePokemonRepository(
 
     override fun observeList(profileId: Long, filter: PokemonFilter): Flow<List<PokemonSummary>> {
         observedFilters += filter
-        return combine(all, statuses) { list, st ->
+        val query = SearchQuery.normalize(filter.query)
+        return combine(all, statuses, typeMembers) { list, st, members ->
             val profileStatuses = st[profileId].orEmpty()
             list.filter { p ->
-                (filter.query.isBlank() || p.name.contains(filter.query) || p.id.toString() == filter.query) &&
-                    (filter.type == null || filter.type in p.types) &&
+                (query.isBlank() || p.name.contains(query) || p.id.toString() == query) &&
+                    (filter.type == null || filter.type in p.types || p.id in members[filter.type].orEmpty()) &&
                     (filter.status == null || (profileStatuses[p.id] ?: CatchStatus.NONE) == filter.status)
             }.let { if (filter.sort == SortOrder.NAME) it.sortedBy { p -> p.name } else it.sortedBy { p -> p.id } }
         }
@@ -149,6 +177,8 @@ class FakePokemonRepository(
 
     override fun observeCacheStats(): Flow<CacheStats> = all.map { CacheStats(it.size, it.count { p -> p.hasDetails }) }
 
+    override fun observeCatalog(): Flow<CatalogState> = catalog
+
     override suspend fun refreshFirstPage(force: Boolean): Result<Unit> {
         refreshCalls++
         refreshGate?.await()
@@ -157,7 +187,10 @@ class FakePokemonRepository(
         return result
     }
 
-    override suspend fun loadNextPage(): Result<Boolean> = Result.success(false)
+    override suspend fun loadNextPage(): Result<Unit> {
+        loadNextCalls++
+        return Result.success(Unit)
+    }
 
     override suspend fun refreshDetail(id: Int, force: Boolean): Result<Boolean> {
         detailRefreshIds += id to force
@@ -166,7 +199,21 @@ class FakePokemonRepository(
         return result
     }
 
-    override suspend fun hasLocalMatch(query: String): Boolean = all.value.any { it.name == query }
+    override suspend fun refreshType(type: String, force: Boolean): Result<Boolean> {
+        typeCalls += type to force
+        val result = typeResults.removeFirstOrNull() ?: Result.success(true)
+        if (result.isSuccess) {
+            val members = typeServer[type].orEmpty()
+            all.update { current -> (current + members.filterNot { m -> current.any { it.id == m.id } }) }
+            typeMembers.update { it + (type to members.map { m -> m.id }.toSet()) }
+        }
+        return result
+    }
+
+    override suspend fun hasLocalMatch(query: String): Boolean {
+        val key = SearchQuery.normalize(query)
+        return all.value.any { it.name == key || it.id.toString() == key }
+    }
 
     override suspend fun lookupRemote(query: String): Result<Int?> {
         remoteStarted += query
@@ -276,22 +323,72 @@ class FakeHistoryRepository : HistoryRepository {
     override suspend fun clear(profileId: Long) = Unit
 }
 
+class FakeProfileRepository : ProfileRepository {
+    val profiles = MutableStateFlow<List<Profile>>(emptyList())
+
+    override fun observeProfiles(): Flow<List<Profile>> = profiles
+
+    override suspend fun createProfile(name: String): Result<Long> = runCatching {
+        val valid = NameValidator.validate(name, profiles.value.map { it.name })
+        val id = profiles.value.size + 1L
+        profiles.update { it + Profile(id, valid, colorIndex = 0, createdAt = 0) }
+        id
+    }
+
+    override suspend fun deleteProfile(profileId: Long) {
+        profiles.update { list -> list.filterNot { it.id == profileId } }
+    }
+}
+
+/** Records which images were requested; [failing] urls can't be downloaded. */
+class FakeImagePrefetcher : ImagePrefetcher {
+    val cached: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+    val downloads: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    var failing: (String) -> Boolean = { false }
+
+    override suspend fun ensureCached(urls: List<String>): Int {
+        var failed = 0
+        for (url in urls) {
+            if (url in cached) continue
+            downloads += url
+            if (failing(url)) failed++ else cached += url
+        }
+        return failed
+    }
+}
+
 // ------------------------------------------------------------------ Fake network
 
 fun httpError(code: Int): HttpException =
     HttpException(Response.error<Any>(code, "".toResponseBody(null)))
 
-/** Fake PokeAPI backed by a list of names; ids are 1-based positions. */
+/**
+ * Fake PokeAPI backed by a list of names; ids are 1-based positions.
+ * Every pokemon has exactly one type: [typeOf] (fire / grass / water by id % 3).
+ */
 class FakePokeApi(private val names: List<String> = DEFAULT_NAMES) : PokeApi {
     var listCalls = 0
         private set
-    val detailCalls = mutableListOf<String>()
-    var failList = false
-    var failAll = false
-    val failingIds = mutableSetOf<Int>()
+    /** Offsets of every list request, to check paging. */
+    val listOffsets: MutableList<Int> = Collections.synchronizedList(mutableListOf())
+    val detailCalls: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    val typeCalls: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    @Volatile var failList = false
+    @Volatile var failDetails = false
+    @Volatile var failAll = false
+    val failingIds: MutableSet<Int> = Collections.synchronizedSet(mutableSetOf())
+
+    /** Ids whose next detail request fails once. */
+    val failOnce: MutableSet<Int> = Collections.synchronizedSet(mutableSetOf())
+
+    /** Simulated latency of a detail request and the observed parallelism. */
+    var detailDelayMs = 0L
+    private val inFlight = AtomicInteger(0)
+    val maxInFlight = AtomicInteger(0)
 
     override suspend fun getPokemonList(limit: Int, offset: Int): PokemonListResponseDto {
         listCalls++
+        listOffsets += offset
         if (failList || failAll) throw IOException("offline")
         val page = names.drop(offset).take(limit).mapIndexed { i, name ->
             NamedResourceDto(name, "https://pokeapi.co/api/v2/pokemon/${offset + i + 1}/")
@@ -302,21 +399,38 @@ class FakePokeApi(private val names: List<String> = DEFAULT_NAMES) : PokeApi {
 
     override suspend fun getPokemon(idOrName: String): PokemonDetailDto {
         detailCalls += idOrName
+        val now = inFlight.incrementAndGet()
+        maxInFlight.updateAndGet { maxOf(it, now) }
+        try {
+            if (detailDelayMs > 0) delay(detailDelayMs)
+            if (failAll || failDetails) throw IOException("offline")
+            val id = idOrName.toIntOrNull() ?: (names.indexOf(idOrName) + 1).takeIf { it > 0 } ?: throw httpError(404)
+            if (id !in 1..names.size) throw httpError(404)
+            if (id in failingIds) throw IOException("flaky")
+            if (failOnce.remove(id)) throw IOException("flaky once")
+            return PokemonDetailDto(
+                id = id,
+                name = names[id - 1],
+                height = 7,
+                weight = 69,
+                baseExperience = 64,
+                types = listOf(TypeSlotDto(1, NamedResourceDto(typeOf(id), ""))),
+                stats = listOf(StatDto(45, NamedResourceDto("hp", "")), StatDto(49, NamedResourceDto("attack", ""))),
+            )
+        } finally {
+            inFlight.decrementAndGet()
+        }
+    }
+
+    override suspend fun getType(name: String): TypeDetailDto {
+        typeCalls += name
         if (failAll) throw IOException("offline")
-        val id = idOrName.toIntOrNull() ?: (names.indexOf(idOrName) + 1).takeIf { it > 0 } ?: throw httpError(404)
-        if (id !in 1..names.size) throw httpError(404)
-        if (id in failingIds) throw IOException("flaky")
-        return PokemonDetailDto(
-            id = id,
-            name = names[id - 1],
-            height = 7,
-            weight = 69,
-            baseExperience = 64,
-            types = listOf(
-                TypeSlotDto(2, NamedResourceDto("poison", "")),
-                TypeSlotDto(1, NamedResourceDto("grass", "")),
-            ),
-            stats = listOf(StatDto(45, NamedResourceDto("hp", "")), StatDto(49, NamedResourceDto("attack", ""))),
+        val members = names.indices.map { it + 1 }.filter { typeOf(it) == name }
+        return TypeDetailDto(
+            name = name,
+            pokemon = members.map { id ->
+                TypePokemonDto(1, NamedResourceDto(names[id - 1], "https://pokeapi.co/api/v2/pokemon/$id/"))
+            },
         )
     }
 
@@ -325,5 +439,10 @@ class FakePokeApi(private val names: List<String> = DEFAULT_NAMES) : PokeApi {
             "bulbasaur", "ivysaur", "venusaur", "charmander", "charmeleon",
             "charizard", "squirtle", "wartortle", "blastoise", "caterpie",
         )
+
+        fun typeOf(id: Int): String = listOf("fire", "grass", "water")[id % 3]
+
+        /** n generated names: "mon1", "mon2", ... */
+        fun generated(n: Int): List<String> = (1..n).map { "mon$it" }
     }
 }

@@ -101,6 +101,18 @@ data class CacheStats(
     val detailedCount: Int,
 )
 
+/**
+ * Paging position of the national catalogue, derived from Room on every change.
+ * [loaded] = length of the contiguous prefix of the server list stored locally;
+ * [total] = list size reported by the server (null until the first page is loaded).
+ */
+data class CatalogState(
+    val loaded: Int,
+    val total: Int?,
+) {
+    val canLoadMore: Boolean get() = total == null || loaded < total
+}
+
 val POKEMON_TYPES = listOf(
     "normal", "fire", "water", "grass", "electric", "ice", "fighting", "poison", "ground",
     "flying", "psychic", "bug", "rock", "ghost", "dragon", "dark", "steel", "fairy",

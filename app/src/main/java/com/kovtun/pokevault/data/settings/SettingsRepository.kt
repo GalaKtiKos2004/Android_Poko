@@ -22,9 +22,17 @@ data class AppSettings(
     val backgroundSync: Boolean = true,
     val wifiOnly: Boolean = false,
     val prefetchCount: Int = DEFAULT_PREFETCH,
+    /** Last sync that finished with every item updated. */
     val lastSyncAt: Long? = null,
+    /** Last sync attempt, successful or not, and how many items it failed to update. */
+    val lastSyncAttemptAt: Long? = null,
+    val lastSyncFailures: Int = 0,
     val lastListRefreshAt: Long? = null,
+    /** Size of the server list, needed to know whether more pages exist. */
+    val catalogTotal: Int? = null,
 ) {
+    val lastAttemptIncomplete: Boolean
+        get() = lastSyncAttemptAt != null && lastSyncFailures > 0
     companion object {
         const val DEFAULT_TTL_HOURS = 24
         const val DEFAULT_PREFETCH = 151
@@ -50,12 +58,18 @@ interface SettingsRepository {
     fun profileSettings(profileId: Long): Flow<ProfileSettings>
 
     suspend fun setActiveProfile(profileId: Long?)
+
+    /** Atomically forgets the active profile if it is [profileId] (used when that profile is deleted). */
+    suspend fun clearActiveProfileIf(profileId: Long)
     suspend fun setCacheTtlHours(hours: Int)
     suspend fun setBackgroundSync(enabled: Boolean)
     suspend fun setWifiOnly(enabled: Boolean)
     suspend fun setPrefetchCount(count: Int)
-    suspend fun setLastSyncAt(time: Long)
     suspend fun setLastListRefreshAt(time: Long?)
+    suspend fun setCatalogTotal(total: Int)
+
+    /** Records a sync attempt; [lastSyncAt] moves only when nothing failed. */
+    suspend fun recordSyncAttempt(time: Long, failures: Int)
 
     suspend fun setTheme(profileId: Long, mode: ThemeMode)
     suspend fun setDefaultSort(profileId: Long, sort: SortOrder)
@@ -76,6 +90,9 @@ class DataStoreSettingsRepository @Inject constructor(
         val PREFETCH_COUNT = intPreferencesKey("prefetch_count")
         val LAST_SYNC = longPreferencesKey("last_sync_at")
         val LAST_LIST_REFRESH = longPreferencesKey("last_list_refresh_at")
+        val LAST_SYNC_ATTEMPT = longPreferencesKey("last_sync_attempt_at")
+        val LAST_SYNC_FAILURES = intPreferencesKey("last_sync_failures")
+        val CATALOG_TOTAL = intPreferencesKey("catalog_total")
 
         fun theme(profileId: Long) = stringPreferencesKey("p${profileId}_theme")
         fun sort(profileId: Long) = stringPreferencesKey("p${profileId}_sort")
@@ -92,7 +109,10 @@ class DataStoreSettingsRepository @Inject constructor(
             wifiOnly = prefs[Keys.WIFI_ONLY] ?: false,
             prefetchCount = prefs[Keys.PREFETCH_COUNT] ?: AppSettings.DEFAULT_PREFETCH,
             lastSyncAt = prefs[Keys.LAST_SYNC],
+            lastSyncAttemptAt = prefs[Keys.LAST_SYNC_ATTEMPT],
+            lastSyncFailures = prefs[Keys.LAST_SYNC_FAILURES] ?: 0,
             lastListRefreshAt = prefs[Keys.LAST_LIST_REFRESH],
+            catalogTotal = prefs[Keys.CATALOG_TOTAL],
         )
     }.distinctUntilChanged()
 
@@ -116,6 +136,24 @@ class DataStoreSettingsRepository @Inject constructor(
         }
     }
 
+    override suspend fun clearActiveProfileIf(profileId: Long) {
+        dataStore.edit { prefs ->
+            if (prefs[Keys.ACTIVE_PROFILE] == profileId) prefs.remove(Keys.ACTIVE_PROFILE)
+        }
+    }
+
+    override suspend fun setCatalogTotal(total: Int) {
+        dataStore.edit { it[Keys.CATALOG_TOTAL] = total }
+    }
+
+    override suspend fun recordSyncAttempt(time: Long, failures: Int) {
+        dataStore.edit { prefs ->
+            prefs[Keys.LAST_SYNC_ATTEMPT] = time
+            prefs[Keys.LAST_SYNC_FAILURES] = failures
+            if (failures == 0) prefs[Keys.LAST_SYNC] = time
+        }
+    }
+
     override suspend fun setCacheTtlHours(hours: Int) {
         dataStore.edit { it[Keys.TTL_HOURS] = hours }
     }
@@ -130,10 +168,6 @@ class DataStoreSettingsRepository @Inject constructor(
 
     override suspend fun setPrefetchCount(count: Int) {
         dataStore.edit { it[Keys.PREFETCH_COUNT] = count }
-    }
-
-    override suspend fun setLastSyncAt(time: Long) {
-        dataStore.edit { it[Keys.LAST_SYNC] = time }
     }
 
     override suspend fun setLastListRefreshAt(time: Long?) {

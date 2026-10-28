@@ -3,8 +3,8 @@ package com.kovtun.pokevault.data
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.kovtun.pokevault.data.local.CatalogRow
 import com.kovtun.pokevault.data.local.PokeVaultDatabase
-import com.kovtun.pokevault.data.local.PokemonEntity
 import com.kovtun.pokevault.data.repository.OfflineFirstPokemonRepository
 import com.kovtun.pokevault.data.repository.RoomCollectionRepository
 import com.kovtun.pokevault.data.repository.RoomHistoryRepository
@@ -19,6 +19,8 @@ import com.kovtun.pokevault.testutil.FakeClock
 import com.kovtun.pokevault.testutil.FakePokeApi
 import com.kovtun.pokevault.testutil.FakeSettingsRepository
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.After
@@ -56,9 +58,7 @@ class UserDataIntegrationTest {
         history = RoomHistoryRepository(db.historyDao(), clock, io)
         presets = RoomPresetRepository(db.filterPresetDao(), clock, io)
         pokemon = OfflineFirstPokemonRepository(FakePokeApi(), db.pokemonDao(), settings, clock, io)
-        db.pokemonDao().upsertListItems(
-            (1..5).map { PokemonEntity(id = it, name = "p$it", spriteUrl = "s", listUpdatedAt = 0) },
-        )
+        db.pokemonDao().saveCatalogPage((1..5).map { CatalogRow(it, "p$it", "s", index = it - 1) }, now = 0)
     }
 
     @After
@@ -97,6 +97,7 @@ class UserDataIntegrationTest {
         profiles.deleteProfile(ash)
 
         assertEquals(SessionState.NoProfile, profiles.session.first())
+        assertNull("no dangling active id in DataStore", settings.active.value)
         assertTrue(collections.observeCollections(ash).first().isEmpty())
         assertNull(db.userPokemonDao().get(ash, 3))
         assertTrue(history.observe(ash).first().isEmpty())
@@ -158,5 +159,52 @@ class UserDataIntegrationTest {
         assertTrue("note keeps the row alive", db.userPokemonDao().get(ash, 1) != null)
         userPokemon.setNote(ash, 1, "")
         assertNull(db.userPokemonDao().get(ash, 1))
+    }
+
+    @Test
+    fun deletingAnotherProfileKeepsTheActiveOne() = runTest {
+        val ash = profiles.createProfile("Ash").getOrThrow()
+        val misty = profiles.createProfile("Misty").getOrThrow()
+        profiles.switchTo(ash)
+
+        profiles.deleteProfile(misty)
+
+        assertEquals(ash, settings.active.value)
+        assertEquals(ash, (profiles.session.first() as SessionState.Active).profile.id)
+    }
+
+    @Test
+    fun simultaneousStatusChangeAndNoteSaveKeepBothFields() = runTest {
+        val ash = profiles.createProfile("Ash").getOrThrow()
+        val ids = 1..300
+
+        // Real threads: each pokemon gets a status and a note written at the same time.
+        ids.flatMap { id ->
+            listOf(
+                async(Dispatchers.IO) { userPokemon.setStatus(ash, id, CatchStatus.CAUGHT) },
+                async(Dispatchers.IO) { userPokemon.setNote(ash, id, "note $id") },
+            )
+        }.awaitAll()
+
+        ids.forEach { id ->
+            val row = db.userPokemonDao().get(ash, id)
+            assertEquals("status of $id", "CAUGHT", row?.status)
+            assertEquals("note of $id", "note $id", row?.note)
+        }
+    }
+
+    @Test
+    fun clearingStatusWhileNoteIsSavedNeverLeavesAnEmptyRowOrLosesTheNote() = runTest {
+        val ash = profiles.createProfile("Ash").getOrThrow()
+        userPokemon.setStatus(ash, 1, CatchStatus.WANT)
+
+        listOf(
+            async(Dispatchers.IO) { userPokemon.setStatus(ash, 1, CatchStatus.NONE) },
+            async(Dispatchers.IO) { userPokemon.setNote(ash, 1, "keep me") },
+        ).awaitAll()
+
+        val row = db.userPokemonDao().get(ash, 1)
+        assertEquals("NONE", row?.status)
+        assertEquals("keep me", row?.note)
     }
 }
