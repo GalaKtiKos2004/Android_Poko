@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Simple original "vault ball" mark: white lower half, dark band, centre button. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M30,54 A24,24 0 0,0 78,54 Z" />
+    <path
+        android:fillColor="#FF1B1B1F"
+        android:pathData="M30,52 L78,52 L78,56 L30,56 Z" />
+    <path
+        android:fillColor="#FF1B1B1F"
+        android:pathData="M54,46 A8,8 0 1,1 53.99,46 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,50 A4,4 0 1,1 53.99,50 Z" />
+</vector>
